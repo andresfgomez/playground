@@ -1,1 +1,369 @@
+Awesome use case. Here’s a clean, production-ready pattern for an in-memory conversation store that keeps a rolling context (bounded by tokens) and handles tool calls/responses with the OpenAI Chat Completions API.
 
+I’ll give you:
+	1.	the memory model (with token budgeting + trimming),
+	2.	a tiny tool registry and executor,
+	3.	a conversation loop that resolves tool calls until a final answer,
+	4.	a short runnable example.
+
+⸻
+
+1) Install & imports
+
+pip install openai tiktoken
+
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import List, Deque, Dict, Any, Callable, Optional, Tuple
+from collections import deque
+import json, time
+
+import tiktoken
+from openai import OpenAI
+client = OpenAI()
+
+
+⸻
+
+2) Lightweight message & tool models
+
+@dataclass
+class Msg:
+    role: str                  # "system" | "user" | "assistant" | "tool"
+    content: str | None = None
+    # For assistant messages that *request* tool calls:
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+    # For tool messages that *answer* a tool call:
+    tool_call_id: Optional[str] = None
+
+@dataclass
+class ToolSpec:
+    """Holds tool schema (for the API) and an executable Python function."""
+    schema: Dict[str, Any]             # OpenAI 'tools' item: {"type":"function", "function":{...}}
+    func: Callable[..., Any]           # Python function to actually execute
+
+@dataclass
+class Turn:
+    """One logical turn can be: user -> assistant (+ tool calls) -> tool results -> assistant."""
+    messages: List[Msg] = field(default_factory=list)
+
+
+⸻
+
+3) Tokenizer + budget helper
+
+class TokenBudget:
+    def __init__(self, model: str, max_context_tokens: int):
+        self.model = model
+        self.max_context_tokens = max_context_tokens
+        try:
+            self.enc = tiktoken.encoding_for_model(model)
+        except Exception:
+            # Fallback to a reasonable default
+            self.enc = tiktoken.get_encoding("cl100k_base")
+
+    def count(self, messages: List[Dict[str, Any]]) -> int:
+        """
+        Rough but practical token count for chat messages.
+        """
+        total = 0
+        # Minimal overhead per message; exact accounting varies by model, but this is a solid approximation.
+        overhead_per_msg = 4
+        overhead_reply = 2
+        for m in messages:
+            total += overhead_per_msg
+            if m.get("content"):
+                total += len(self.enc.encode(m["content"]))
+            # Tool messages have 'name' or 'tool_call_id' fields (small overhead)
+            if "name" in m and m["name"]:
+                total += len(self.enc.encode(m["name"]))
+        total += overhead_reply
+        return total
+
+
+⸻
+
+4) In-memory conversation store (token-trimmed, tool-aware)
+
+class ConversationMemory:
+    """
+    Keeps a rolling window of messages (system + turns) and trims to fit a token budget.
+    Also ensures assistant tool-calls and their tool results are kept together.
+    """
+    def __init__(self, model: str, max_context_tokens: int = 12_000):
+        self.model = model
+        self.system: List[Msg] = []
+        self.turns: Deque[Turn] = deque()
+        self.token_budget = TokenBudget(model, max_context_tokens)
+
+    def set_system(self, content: str):
+        self.system = [Msg(role="system", content=content)]
+
+    def add_user(self, content: str):
+        self.turns.append(Turn(messages=[Msg(role="user", content=content)]))
+
+    def add_assistant(self, content: str | None, tool_calls: Optional[List[Dict[str, Any]]] = None):
+        if not self.turns:
+            self.turns.append(Turn())
+        self.turns[-1].messages.append(Msg(role="assistant", content=content, tool_calls=tool_calls))
+
+    def add_tool_result(self, tool_call_id: str, content: str):
+        if not self.turns:
+            self.turns.append(Turn())
+        self.turns[-1].messages.append(Msg(role="tool", content=content, tool_call_id=tool_call_id))
+
+    def _flatten(self) -> List[Msg]:
+        msgs = []
+        msgs.extend(self.system)
+        for t in self.turns:
+            msgs.extend(t.messages)
+        return msgs
+
+    def as_openai_messages(self, reserve_for_reply: int = 1024) -> List[Dict[str, Any]]:
+        """
+        Returns messages trimmed to fit (max_context_tokens - reserve_for_reply).
+        Trimming happens from the oldest turns forward, but keeps tool-call blocks intact.
+        """
+        # Build full list first
+        flat = self._flatten()
+
+        def to_wire(m: Msg) -> Dict[str, Any]:
+            d = {"role": m.role, "content": m.content}
+            if m.role == "assistant" and m.tool_calls:
+                d["tool_calls"] = m.tool_calls
+            if m.role == "tool" and m.tool_call_id:
+                d["tool_call_id"] = m.tool_call_id
+            return d
+
+        wire = [to_wire(m) for m in flat]
+        total_limit = self.token_budget.max_context_tokens - reserve_for_reply
+
+        # Fast path if already under budget
+        if self.token_budget.count(wire) <= total_limit:
+            return wire
+
+        # Otherwise trim from oldest user turn upward, but try not to break
+        # assistant-tool_calls + subsequent tool messages groups.
+        # We’ll drop entire earliest turns until we fit.
+        # Identify message indices per turn
+        turn_indices: List[Tuple[int,int]] = []
+        idx = len(self.system)
+        for turn in self.turns:
+            start = idx
+            idx += len(turn.messages)
+            end = idx  # exclusive
+            turn_indices.append((start, end))
+
+        keep_from = 0
+        while keep_from < len(turn_indices):
+            sliced = wire[:len(self.system)] + [x for i,(s,e) in enumerate(turn_indices) if i >= keep_from for x in wire[s:e]]
+            if self.token_budget.count(sliced) <= total_limit:
+                wire = sliced
+                break
+            keep_from += 1
+
+        # If still too big, last resort: keep only system + last turn
+        if self.token_budget.count(wire) > total_limit and turn_indices:
+            s, e = turn_indices[-1]
+            wire = wire[:len(self.system)] + wire[s:e]
+            # If *still* too big, keep just the last user message content
+            if self.token_budget.count(wire) > total_limit:
+                # Try to compress the last user/assistant contents (rudimentary):
+                for m in wire[len(self.system):]:
+                    if m["role"] in ("user", "assistant") and m.get("content"):
+                        # keep first ~1000 chars
+                        m["content"] = m["content"][:1000]
+                        if self.token_budget.count(wire) <= total_limit:
+                            break
+
+        return wire
+
+
+⸻
+
+5) Tool registry & executor
+
+class ToolRegistry:
+    def __init__(self):
+        self._tools: Dict[str, ToolSpec] = {}
+
+    def register(self, name: str, schema: Dict[str, Any], func: Callable[..., Any]):
+        self._tools[name] = ToolSpec(schema=schema, func=func)
+
+    @property
+    def tool_schemas(self) -> List[Dict[str, Any]]:
+        return [spec.schema for spec in self._tools.values()]
+
+    def call(self, name: str, arguments_json: str) -> str:
+        if name not in self._tools:
+            raise ValueError(f"Tool '{name}' not registered")
+        args = json.loads(arguments_json) if arguments_json else {}
+        result = self._tools[name].func(**args)
+        # Always stringify for the 'tool' message
+        if isinstance(result, (dict, list)):
+            return json.dumps(result)
+        return str(result)
+
+
+⸻
+
+6) Conversation runner (Chat Completions + tool loop)
+
+class ChatRunner:
+    def __init__(self, model: str, memory: ConversationMemory, tools: ToolRegistry):
+        self.model = model
+        self.memory = memory
+        self.tools = tools
+
+    def ask(self, user_text: str, max_tool_hops: int = 4, temperature: float = 0.2) -> str:
+        self.memory.add_user(user_text)
+
+        final_answer: Optional[str] = None
+
+        for hop in range(max_tool_hops + 1):
+            # Build a trimmed context that leaves room for the next reply
+            msgs = self.memory.as_openai_messages(reserve_for_reply=1024)
+
+            resp = client.chat.completions.create(
+                model=self.model,
+                messages=msgs,
+                tools=self.tools.tool_schemas or None,
+                tool_choice="auto" if self.tools.tool_schemas else None,
+                temperature=temperature,
+            )
+
+            choice = resp.choices[0]
+            msg = choice.message
+
+            # If the assistant *requests* tools:
+            if getattr(msg, "tool_calls", None):
+                self.memory.add_assistant(content=msg.content, tool_calls=[tc.model_dump() for tc in msg.tool_calls])  # store assistant msg + tool_calls
+
+                # Execute each tool call and add 'tool' messages
+                for tc in msg.tool_calls:
+                    name = tc.function.name
+                    args = tc.function.arguments
+                    tool_call_id = tc.id
+                    try:
+                        tool_output = self.tools.call(name, args)
+                    except Exception as e:
+                        tool_output = json.dumps({"error": str(e)})
+
+                    self.memory.add_tool_result(tool_call_id=tool_call_id, content=tool_output)
+
+                # Loop again, now the tool outputs are in memory
+                continue
+
+            # Otherwise, we have a final assistant message
+            final_answer = msg.content or ""
+            self.memory.add_assistant(content=final_answer)  # store the final answer
+            break
+
+        if final_answer is None:
+            # Max hops reached without a final message; you can decide what to do:
+            final_answer = "(No final answer produced—tool loop hit hop limit.)"
+
+        return final_answer
+
+
+⸻
+
+7) Example tools + end-to-end usage
+
+Below, two example tools: a toy calculator and a toy “search logs” stub (to mirror a Splunk-ish use case). Replace the functions with your real ones—just keep the signatures aligned with the JSON schemas.
+
+# ---- Define tools ----
+
+def calc(op: str, a: float, b: float) -> dict:
+    if op == "add": v = a + b
+    elif op == "sub": v = a - b
+    elif op == "mul": v = a * b
+    elif op == "div": v = a / b if b != 0 else float("inf")
+    else: raise ValueError(f"Unsupported op {op}")
+    return {"op": op, "a": a, "b": b, "result": v}
+
+calc_schema = {
+    "type": "function",
+    "function": {
+        "name": "calc",
+        "description": "Basic calculator.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "op": {"type": "string", "enum": ["add", "sub", "mul", "div"]},
+                "a": {"type": "number"},
+                "b": {"type": "number"},
+            },
+            "required": ["op", "a", "b"],
+            "additionalProperties": False,
+        },
+        "strict": True
+    },
+}
+
+def search_logs(query: str, time_range: str = "last_24h", limit: int = 5) -> dict:
+    # Stub: return mock hits. Replace with real Splunk/ELK call.
+    hits = [
+        {"ts": "2025-10-21T00:00:00Z", "msg": f"[MOCK] {query} - item 1"},
+        {"ts": "2025-10-21T00:05:00Z", "msg": f"[MOCK] {query} - item 2"},
+    ]
+    return {"query": query, "time_range": time_range, "hits": hits[:limit]}
+
+search_logs_schema = {
+    "type": "function",
+    "function": {
+        "name": "search_logs",
+        "description": "Run a log search and return recent hits.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "time_range": {"type": "string"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100}
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+        "strict": True
+    },
+}
+
+# ---- Wire everything together ----
+
+MODEL = "gpt-4o-mini"  # or your preferred Chat Completions model
+
+memory = ConversationMemory(model=MODEL, max_context_tokens=12_000)
+memory.set_system(
+    "You are a helpful assistant. When you use tools, explain your reasoning briefly and cite the results."
+)
+
+tools = ToolRegistry()
+tools.register("calc", calc_schema, calc)
+tools.register("search_logs", search_logs_schema, search_logs)
+
+runner = ChatRunner(model=MODEL, memory=memory, tools=tools)
+
+# ---- Try a multi-turn session ----
+print(runner.ask("Hi! If CPU error rate doubled from 2.5% to 5%, what's the delta? Use calc."))
+print(runner.ask("Search logs for 'CPU error spike' in the last 24h, then summarize briefly."))
+print(runner.ask("Great. Now suggest two remediation steps."))
+
+
+⸻
+
+How this meets your goals
+	•	In-memory database: ConversationMemory keeps everything in Python objects (lists/deques). It’s fast and ephemeral.
+	•	Context window control: as_openai_messages() trims oldest turns to stay within a token budget (using tiktoken). It keeps assistant tool calls tied to their corresponding tool results, so the model doesn’t “forget” the tool outputs.
+	•	Tool calls & responses: Assistant messages with tool_calls are captured; each tool’s result is stored as a role="tool" message with the tool_call_id, per the Chat Completions contract.
+	•	Multiple tool hops: ChatRunner.ask() loops tool→model→tool… until a final assistant message (or a hop limit).
+	•	Drop-in tools: ToolRegistry lets you add any function. The schema you register is sent in tools=[...]; the corresponding Python function is invoked with parsed JSON args.
+
+⸻
+
+Variations / next steps
+	•	Persistence: If you later want durability, persist each Turn to SQLite/Redis, keyed by session_id. The trimming algorithm stays the same.
+	•	Parallel tools: If a reply triggers multiple tool calls, the loop already executes them sequentially. You could run them in parallel (async) and aggregate results before the next model call.
+	•	Redaction / summarization: Before trimming away old turns entirely, summarize stale content into a compact memo message to preserve context in fewer tokens.
+	•	Safety: Validate tool args rigorously; surface exceptions to the model (as a tool output) or to the user.
+
+If you share any particular tools you want wired (e.g., your Splunk query runner), I’ll adapt the schemas and the flow to your exact interfaces.
